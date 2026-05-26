@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANS Diagnostics Engine</title>
+    <style>
+        :root { --bg: #05070f; --panel: #0f1322; --accent: #39ff14; --text: #d1d5db; }
+        body { background: var(--bg); color: var(--text); font-family: monospace; margin: 0; padding: 15px; }
+        .container { max-width: 100%; margin: 0 auto; }
+        .panel { background: var(--panel); padding: 20px; border-radius: 4px; border: 1px solid #1e293b; margin-bottom: 15px; }
+        h2 { margin: 0 0 10px 0; font-size: 14px; color: var(--accent); letter-spacing: 2px; text-transform: uppercase; }
+        button { background: var(--accent); color: #000; border: none; padding: 15px; font-weight: bold; cursor: pointer; width: 100%; font-size: 14px; letter-spacing: 1px; }
+        button:disabled { background: #1e293b; color: #4b5563; }
+        .matrix { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px; }
+        .box { background: #070913; padding: 10px; border: 1px solid #1e293b; text-align: center; }
+        .label { font-size: 10px; color: #6b7280; text-transform: uppercase; }
+        .num { font-size: 20px; font-weight: bold; color: #fff; margin-top: 5px; }
+        canvas { width: 100%; height: 140px; background: #000; display: block; border: 1px solid #1e293b; }
+        .terminal { background: #000; color: #84cc16; font-size: 11px; padding: 12px; border: 1px solid #1e293b; max-height: 120px; overflow-y: auto; margin-top: 10px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="panel">
+        <h2>Optical Array Receiver</h2>
+        <video id="v" autoplay playsinline style="display:none;"></video>
+        <canvas id="c"></canvas>
+        <div class="terminal" id="term">SYSTEM INITIALIZED. AWAITING RX EMITTER...</div>
+        <button id="go" style="margin-top:15px;">ENGAGE TELEMETRY SWEEP</button>
+    </div>
+    <div class="panel">
+        <h2>Autonomic Metrics</h2>
+        <div class="matrix">
+            <div class="box"><div class="label">HR (BPM)</div><div class="num" id="m-hr">--</div></div>
+            <div class="box"><div class="label">Beats Tracked</div><div class="num" id="m-cnt">0</div></div>
+            <div class="box"><div class="label">RMSSD (PNS)</div><div class="num" id="m-pns">-- ms</div></div>
+            <div class="box"><div class="label">SDNN (ANS)</div><div class="num" id="m-ans">-- ms</div></div>
+        </div>
+    </div>
+</div>
+<script>
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const btn = document.getElementById('go');
+const term = document.getElementById('term');
+let stream = null, animId = null;
+let rawHistory = [], timeHistory = [], rrIntervals = [];
+let active = false, lastPeakTime = 0, emaSignal = 0, adaptiveThreshold = 0;
+const emaBeta = 0.15;
+
+function out(text) {
+    term.textContent += `\n[${performance.now().toFixed(0)}ms] ${text}`;
+    term.scrollTop = term.scrollHeight;
+}
+
+btn.addEventListener('click', async () => {
+    if (active) return;
+    out("Invoking hardware interfaces...");
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment", width: 160, height: 120, frameRate: { ideal: 60 } }, audio: false
+        });
+        video.srcObject = stream;
+        const track = stream.getVideoTracks()[0];
+        const cap = track.getCapabilities();
+        if (cap.torch) {
+            out("LED array found. Igniting emitter source...");
+            await track.applyConstraints({ advanced: [{ torch: true }] });
+        }
+    } catch (e) {
+        out("Hardware initialization fault: " + e.message);
+        return;
+    }
+    rawHistory = []; timeHistory = []; rrIntervals = []; active = true;
+    btn.disabled = true; btn.innerText = "SAMPLING DATA FEED...";
+    setTimeout(terminateEngine, 45000);
+    animId = requestAnimationFrame(processingLoop);
+});
+
+function processingLoop() {
+    if (!active) return;
+    if (video.readyState === video.HAVE_CURRENT_DATA) {
+        if (canvas.width !== 120) { canvas.width = 120; canvas.height = 90; }
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const frame = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let totalLuminance = 0;
+        for (let i = 0; i < frame.length; i += 8) {
+            totalLuminance += (frame[i] * 0.299) + (frame[i+1] * 0.587) + (frame[i+2] * 0.114);
+        }
+        let rawSample = totalLuminance / (frame.length / 8);
+        emaSignal = emaSignal + emaBeta * (rawSample - emaSignal);
+        const now = performance.now();
+        rawHistory.push(emaSignal); timeHistory.push(now);
+        if (rawHistory.length > 200) { rawHistory.shift(); timeHistory.shift(); }
+        evaluateSignalTensors(now); drawTelemetry();
+    }
+    animId = requestAnimationFrame(processingLoop);
+}
+
+function evaluateSignalTensors(now) {
+    if (rawHistory.length < 20) return;
+    let currentVal = rawHistory[rawHistory.length - 1];
+    let mean = rawHistory.slice(-50).reduce((a, b) => a + b, 0) / 50;
+    if (currentVal > adaptiveThreshold) { adaptiveThreshold = currentVal; } 
+    else { adaptiveThreshold -= (adaptiveThreshold - mean) * 0.05; }
+    let idx = rawHistory.length - 2;
+    if (rawHistory[idx] > rawHistory[idx-1] && rawHistory[idx] > rawHistory[idx+1] && rawHistory[idx] > mean) {
+        let elapsed = now - lastPeakTime;
+        if (elapsed > 400 && elapsed < 1500) {
+            rrIntervals.push(elapsed); lastPeakTime = now;
+            document.getElementById('m-cnt').innerText = rrIntervals.length;
+            document.getElementById('m-hr').innerText = Math.round(60000 / elapsed);
+            out(`Pulse beat captured: RR = ${elapsed.toFixed(0)}ms`);
+        }
+    }
+}
+
+function drawTelemetry() {
+    ctx.fillStyle = '#02040a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (rawHistory.length < 2) return;
+    const min = Math.min(...rawHistory); const max = Math.max(...rawHistory);
+    const range = (max - min) || 1;
+    ctx.strokeStyle = '#39ff14'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let i = 0; i < rawHistory.length; i++) {
+        let x = (i / rawHistory.length) * canvas.width;
+        let y = canvas.height - ((rawHistory[i] - min) / range * canvas.height);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+}
+
+function terminateEngine() {
+    active = false; cancelAnimationFrame(animId);
+    btn.innerText = "SWEEP COMPLETE"; out("Processing calculations...");
+    if (stream) { stream.getTracks().forEach(t => t.stop()); }
+    computeAutonomicMatrices();
+}
+
+function computeAutonomicMatrices() {
+    const n = rrIntervals.length;
+    if (n < 5) { out("INSUFFICIENT DATA QUALITY. RE-RUN TEST."); return; }
+    const meanRR = rrIntervals.reduce((a, b) => a + b, 0) / n;
+    let varSum = rrIntervals.reduce((a, b) => a + Math.pow(b - meanRR, 2), 0);
+    let sdnn = Math.sqrt(varSum / (n - 1));
+    let diffSqSum = 0;
+    for (let i = 0; i < n - 1; i++) { diffSqSum += Math.pow(rrIntervals[i+1] - rrIntervals[i], 2); }
+    let rmssd = Math.sqrt(diffSqSum / (n - 1));
+    document.getElementById('m-ans').innerText = sdnn.toFixed(1) + " ms";
+    document.getElementById('m-pns').innerText = rmssd.toFixed(1) + " ms";
+    out("Analysis complete.");
+}
+</script>
+</body>
+</html>
